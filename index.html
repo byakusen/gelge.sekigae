@@ -618,6 +618,8 @@
     let currentGroupTool = 1;
     let isRevealModeActive = false; // めくりモード中かどうか
     let revealedKeys = new Set(); // めくり済みの席キー
+    let unsatisfiedGoodPairs = {}; // 事前配置できなかった仲良しペア（pairKey -> 理由）
+    let lastShuffleWarnings = []; // 直近の席替えで満たせなかった条件の一覧
 
     // --- Group Colors ---
     function getGroupColor(num) {
@@ -707,7 +709,7 @@
         }
         
         state.badPairs = parsePairs('badRulesInput');
-        state.goodPairs = parsePairs('goodRulesInput');
+        state.goodPairs = parsePairs('goodRulesInput', true); // 仲良しは連続ペア方式
         state.visionFront = parseLines('visionFrontInput');
         state.visionNear = parseLines('visionNearInput');
         state.visionNearRows = parseInt(document.getElementById('visionRowsInput').value) || 2;
@@ -726,13 +728,21 @@
     function parseLines(id) {
         return document.getElementById(id).value.split('\n').map(s=>s.trim()).filter(s=>s!=="");
     }
-    function parsePairs(id) {
+    function parsePairs(id, chainMode) {
         const pairs = [];
         document.getElementById(id).value.split('\n').forEach(line => {
             const parts = line.trim().split(/\s+|　+/).filter(s=>s!=="");
             if(parts.length>=2) {
-                for(let i=0; i<parts.length; i++) for(let j=i+1; j<parts.length; j++) 
-                    pairs.push([parts[i], parts[j]].sort().join(','));
+                if (chainMode) {
+                    // 仲良しペア用: 隣り合った名前同士のみペアにする（A B C → A-B, B-C）
+                    // ※全組合せにすると「3人全員が互いに隣」という不可能な条件になるため
+                    for(let i=0; i<parts.length-1; i++)
+                        pairs.push([parts[i], parts[i+1]].sort().join(','));
+                } else {
+                    // NGペア用: 全組合せ（A B C → 3人とも互いに離す）
+                    for(let i=0; i<parts.length; i++) for(let j=i+1; j<parts.length; j++) 
+                        pairs.push([parts[i], parts[j]].sort().join(','));
+                }
             }
         });
         return [...new Set(pairs)];
@@ -816,9 +826,102 @@
             }
         }
 
-        // 2. Vision Care Allocation
         // 固定席に設定されている名前を収集（配慮割り当てからスキップするため）
         const fixedNames = state.fixedSeats ? new Set(Object.values(state.fixedSeats)) : new Set();
+
+        // === 仲良しペアの事前配置（横並びの席を先に確保する） ===
+        // ※従来はランダム入替で偶然隣になるのを待つ方式だったため、ほぼ成立しなかった
+        unsatisfiedGoodPairs = {}; // pairKey -> 理由メッセージ
+
+        const rowOkFor = (name, r) => {
+            if (state.visionFront.includes(name)) return r === 0;
+            if (state.visionNear.includes(name)) return r < state.visionNearRows;
+            return true;
+        };
+        const genderOf = (name) => state.boys.includes(name) ? 'boy' : (state.girls.includes(name) ? 'girl' : null);
+        const takeSeatFromPool = (key) => {
+            let i = boySeats.findIndex(s => s.key === key);
+            if (i > -1) { boySeats.splice(i, 1); return; }
+            i = girlSeats.findIndex(s => s.key === key);
+            if (i > -1) { girlSeats.splice(i, 1); }
+        };
+        const removeNameFromPool = (name) => {
+            let i = boys.indexOf(name);
+            if (i > -1) { boys.splice(i, 1); return; }
+            i = girls.indexOf(name);
+            if (i > -1) { girls.splice(i, 1); }
+        };
+        const seatIsFree = (key) => fullSeatMap[key] !== undefined
+            && allocation[key] === undefined
+            && !(state.fixedSeats && state.fixedSeats[key]);
+
+        shuffle([...state.goodPairs]).forEach(pStr => {
+            const [p1, p2] = pStr.split(',');
+            const g1 = genderOf(p1), g2 = genderOf(p2);
+            if (!g1 || !g2) {
+                unsatisfiedGoodPairs[pStr] = `「${p1}・${p2}」: 名簿にない名前が含まれています`;
+                return;
+            }
+            const k1 = findKey(p1, allocation);
+            const k2 = findKey(p2, allocation);
+
+            if (k1 && k2) {
+                // 両方すでに配置済み（固定席同士など）→ 隣かどうかだけ確認
+                const [r1, c1] = k1.split('-').map(Number);
+                const [r2, c2] = k2.split('-').map(Number);
+                if (!(r1 === r2 && Math.abs(c1 - c2) === 1)) {
+                    unsatisfiedGoodPairs[pStr] = `「${p1}・${p2}」: 両方とも固定席のため隣にできません`;
+                }
+                return;
+            }
+
+            if (k1 || k2) {
+                // 片方が配置済み（固定席など）→ その左右の空席に相手を置く
+                const anchorKey = k1 || k2;
+                const mover = k1 ? p2 : p1;
+                const moverG = k1 ? g2 : g1;
+                const [r, c] = anchorKey.split('-').map(Number);
+                const cands = [`${r}-${c - 1}`, `${r}-${c + 1}`].filter(k =>
+                    seatIsFree(k) && fullSeatMap[k] === moverG && rowOkFor(mover, r));
+                if (cands.length > 0) {
+                    const key = cands[Math.floor(Math.random() * cands.length)];
+                    takeSeatFromPool(key);
+                    removeNameFromPool(mover);
+                    allocation[key] = mover;
+                } else {
+                    unsatisfiedGoodPairs[pStr] = `「${p1}・${p2}」: 固定席の隣に合う性別の空席がありません`;
+                }
+                return;
+            }
+
+            // 両方未配置 → 横並びの空席ペアを全て探して、その中からランダムに選ぶ
+            const cands = [];
+            for (let r = 0; r < state.rows; r++) {
+                for (let c = 0; c < state.cols - 1; c++) {
+                    const a = `${r}-${c}`, b = `${r}-${c + 1}`;
+                    if (!seatIsFree(a) || !seatIsFree(b)) continue;
+                    const ta = fullSeatMap[a], tb = fullSeatMap[b];
+                    if (ta === g1 && tb === g2 && rowOkFor(p1, r) && rowOkFor(p2, r)) cands.push([a, b, p1, p2]);
+                    if (ta === g2 && tb === g1 && rowOkFor(p2, r) && rowOkFor(p1, r)) cands.push([a, b, p2, p1]);
+                }
+            }
+            if (cands.length > 0) {
+                const [a, b, na, nb] = cands[Math.floor(Math.random() * cands.length)];
+                takeSeatFromPool(a); takeSeatFromPool(b);
+                removeNameFromPool(na); removeNameFromPool(nb);
+                allocation[a] = na;
+                allocation[b] = nb;
+            } else {
+                if (g1 === g2) {
+                    const gName = g1 === 'boy' ? '男子' : '女子';
+                    unsatisfiedGoodPairs[pStr] = `「${p1}・${p2}」: ${gName}同士が横に並ぶ席がレイアウト上ありません（市松模様では同性は隣になれません。「配置・班」タブで席の性別を変更してください）`;
+                } else {
+                    unsatisfiedGoodPairs[pStr] = `「${p1}・${p2}」: 条件（性別・視力配慮）に合う横並びの空席がありません`;
+                }
+            }
+        });
+
+        // 2. Vision Care Allocation
 
         const assignListRandomly = (list, maxRow) => {
             const shuffledList = shuffle([...list]);
@@ -861,8 +964,21 @@
             if(!k1 || (state.fixedSeats && state.fixedSeats[k1])) continue; 
             
             const type1 = fullSeatMap[k1];
-            // スワップ先も固定席以外から選ぶ
-            const candidateKeys = seatKeysByType[type1].filter(k => !(state.fixedSeats && state.fixedSeats[k]));
+            // スワップ先の候補を決める
+            let candidateKeys = null;
+            if (v.type === 'good' && v.p2) {
+                // 仲良しペア違反: 相手の左右の席を狙い撃ちでスワップ先にする
+                const kPartner = findKey(v.p2, allocation);
+                if (kPartner) {
+                    const [pr, pc] = kPartner.split('-').map(Number);
+                    candidateKeys = [`${pr}-${pc - 1}`, `${pr}-${pc + 1}`].filter(k =>
+                        fullSeatMap[k] === type1 && !(state.fixedSeats && state.fixedSeats[k]));
+                }
+            }
+            if (!candidateKeys || candidateKeys.length === 0) {
+                // 通常: 同じ性別の席（固定席以外）からランダムに選ぶ
+                candidateKeys = seatKeysByType[type1].filter(k => !(state.fixedSeats && state.fixedSeats[k]));
+            }
             if(!candidateKeys || candidateKeys.length === 0) continue;
             const targetKey = candidateKeys[Math.floor(Math.random()*candidateKeys.length)];
             
@@ -886,6 +1002,36 @@
                 violations = newV;
             }
         }
+
+        // === 満たせなかった条件を集計（結果表示後にユーザーへ通知する） ===
+        lastShuffleWarnings = [];
+        const reported = new Set();
+        getViolations(allocation).forEach(v => {
+            if (v.type === 'good') {
+                const pairKey = [v.p1, v.p2].sort().join(',');
+                if (reported.has('g' + pairKey)) return;
+                reported.add('g' + pairKey);
+                lastShuffleWarnings.push(unsatisfiedGoodPairs[pairKey] || `「${v.p1}・${v.p2}」を隣にできませんでした`);
+            } else if (v.type === 'bad') {
+                if (reported.has('b' + v.p1)) return;
+                reported.add('b' + v.p1);
+                lastShuffleWarnings.push(`「${v.p1}」の近くに離したいペアの相手がいます`);
+            } else if (v.type === 'bad_group') {
+                if (reported.has('bg' + v.p1)) return;
+                reported.add('bg' + v.p1);
+                lastShuffleWarnings.push(`離したいペア（${v.p1}）が同じ班になっています`);
+            } else if (v.type === 'leader_overlap') {
+                const pairKey = [v.p1, v.p2].sort().join(',');
+                if (reported.has('l' + pairKey)) return;
+                reported.add('l' + pairKey);
+                lastShuffleWarnings.push(`リーダー「${v.p1}・${v.p2}」が同じ班になっています`);
+            }
+        });
+        // 事前配置で不可能と判明したが、違反としては検出されないケース（名簿にない名前など）も追加
+        Object.entries(unsatisfiedGoodPairs).forEach(([pairKey, msg]) => {
+            if (!reported.has('g' + pairKey)) lastShuffleWarnings.push(msg);
+        });
+
         return allocation;
     }
 
@@ -982,7 +1128,11 @@
                 const [r2,c2] = k2.split('-').map(Number);
                 // 良いペアの条件: 同じ行、かつ横に隣接していればOK
                 const isPaired = (r1 === r2) && (Math.abs(c1 - c2) === 1);
-                if(!isPaired) v.push({type:'good', p1:p1});
+                if(!isPaired) {
+                    // 双方向に登録: どちらの子を動かしても直せるようにし、違反の重みも上げる
+                    v.push({type:'good', p1:p1, p2:p2});
+                    v.push({type:'good', p1:p2, p2:p1});
+                }
             }
         });
         return v;
@@ -1124,6 +1274,12 @@
         });
         
         confetti({ particleCount: 150, spread: 70, origin: { y: 0.6 } });
+
+        // === 満たせなかった条件があれば先生に通知する ===
+        if (lastShuffleWarnings.length > 0) {
+            const msg = "⚠️ 満たせなかった条件があります:\n\n・" + lastShuffleWarnings.join("\n・") + "\n\nもう一度「席替え」を押すと再抽選できます。";
+            setTimeout(() => { alert(msg); }, revealMode ? 100 : 800);
+        }
     }
 
     // --- Drag & Drop ---
