@@ -432,7 +432,7 @@
                 <textarea id="badRulesInput" class="free-resize" style="background:#ffebee; height:150px;" placeholder="佐藤 鈴木 (スペース区切り)&#10;高橋 田中 (改行して複数入力)"></textarea>
                 
                 <label class="input-label" style="color:#1e88e5; margin-top: 15px;">隣にしたいペア (仲良し)</label>
-                <p style="font-size:0.8rem; color:#666; margin:0 0 5px 0;">横並びのペア席（1-2列目、3-4列目など）に優先配置します。<br>※席の性別指定と合わない場合は配置できません。</p>
+                <p style="font-size:0.8rem; color:#666; margin:0 0 5px 0;">机ペア（1-2列目、3-4列目、5-6列目）の隣同士に優先配置します。通路をはさむ列（2列目と3列目など）は隣になりません。<br>※席の性別指定と合わない場合は配置できません。</p>
                 <textarea id="goodRulesInput" class="free-resize" style="background:#e3f2fd; height:150px;" placeholder="伊藤 山本 (優先的に隣配置)&#10;中村 小林 (改行して複数入力)"></textarea>
 
                 <!-- リーダー設定セクション -->
@@ -866,38 +866,36 @@
             const k2 = findKey(p2, allocation);
 
             if (k1 && k2) {
-                // 両方すでに配置済み（固定席同士など）→ 隣かどうかだけ確認
+                // 両方すでに配置済み（固定席同士など）→ 机ペアの隣かどうか確認
                 const [r1, c1] = k1.split('-').map(Number);
                 const [r2, c2] = k2.split('-').map(Number);
-                if (!(r1 === r2 && Math.abs(c1 - c2) === 1)) {
+                if (!isDeskNeighbor(r1, c1, r2, c2)) {
                     unsatisfiedGoodPairs[pStr] = `「${p1}・${p2}」: 両方とも固定席のため隣にできません`;
                 }
                 return;
             }
 
             if (k1 || k2) {
-                // 片方が配置済み（固定席など）→ その左右の空席に相手を置く
+                // 片方が配置済み（固定席など）→ 机ペアの相方の空席に相手を置く
                 const anchorKey = k1 || k2;
                 const mover = k1 ? p2 : p1;
                 const moverG = k1 ? g2 : g1;
                 const [r, c] = anchorKey.split('-').map(Number);
-                const cands = [`${r}-${c - 1}`, `${r}-${c + 1}`].filter(k =>
-                    seatIsFree(k) && fullSeatMap[k] === moverG && rowOkFor(mover, r));
-                if (cands.length > 0) {
-                    const key = cands[Math.floor(Math.random() * cands.length)];
-                    takeSeatFromPool(key);
+                const partnerKey = `${r}-${deskPartnerCol(c)}`;
+                if (seatIsFree(partnerKey) && fullSeatMap[partnerKey] === moverG && rowOkFor(mover, r)) {
+                    takeSeatFromPool(partnerKey);
                     removeNameFromPool(mover);
-                    allocation[key] = mover;
+                    allocation[partnerKey] = mover;
                 } else {
-                    unsatisfiedGoodPairs[pStr] = `「${p1}・${p2}」: 固定席の隣に合う性別の空席がありません`;
+                    unsatisfiedGoodPairs[pStr] = `「${p1}・${p2}」: 固定席の机ペア側に合う性別の空席がありません`;
                 }
                 return;
             }
 
-            // 両方未配置 → 横並びの空席ペアを全て探して、その中からランダムに選ぶ
+            // 両方未配置 → 机ペア（偶数列とその右）の空席ペアを全て探して、その中からランダムに選ぶ
             const cands = [];
             for (let r = 0; r < state.rows; r++) {
-                for (let c = 0; c < state.cols - 1; c++) {
+                for (let c = 0; c < state.cols - 1; c += 2) { // 偶数列のみ起点（机ペアの左側）
                     const a = `${r}-${c}`, b = `${r}-${c + 1}`;
                     if (!seatIsFree(a) || !seatIsFree(b)) continue;
                     const ta = fullSeatMap[a], tb = fullSeatMap[b];
@@ -967,11 +965,12 @@
             // スワップ先の候補を決める
             let candidateKeys = null;
             if (v.type === 'good' && v.p2) {
-                // 仲良しペア違反: 相手の左右の席を狙い撃ちでスワップ先にする
+                // 仲良しペア違反: 相手の机ペア側の席を狙い撃ちでスワップ先にする
                 const kPartner = findKey(v.p2, allocation);
                 if (kPartner) {
                     const [pr, pc] = kPartner.split('-').map(Number);
-                    candidateKeys = [`${pr}-${pc - 1}`, `${pr}-${pc + 1}`].filter(k =>
+                    const deskKey = `${pr}-${deskPartnerCol(pc)}`;
+                    candidateKeys = [deskKey].filter(k =>
                         fullSeatMap[k] === type1 && !(state.fixedSeats && state.fixedSeats[k]));
                 }
             }
@@ -1047,6 +1046,18 @@
     }
 
     function findKey(name, alloc) { return Object.keys(alloc).find(k=>alloc[k]===name); }
+
+    // 机ペアの隣同士か判定する。
+    // 席は2列ずつのペア（0-1列, 2-3列, 4-5列 = 表示上の1-2列, 3-4列, 5-6列）で、
+    // ペアの間（1列目と2列目の間など）は通路で離れている。
+    // そのため「左側の列が偶数」かつ「列差が1」かつ「同じ行」のときだけ隣とみなす。
+    function isDeskNeighbor(r1, c1, r2, c2) {
+        return r1 === r2 && Math.abs(c1 - c2) === 1 && Math.min(c1, c2) % 2 === 0;
+    }
+    // ある席(r,c)の、机ペアの相方になる列を返す（通路側は除く）。なければ null。
+    function deskPartnerCol(c) {
+        return (c % 2 === 0) ? c + 1 : c - 1;
+    }
 
     function getViolations(alloc) {
         let v = [];
@@ -1126,8 +1137,8 @@
             if(k1 && k2) {
                 const [r1,c1] = k1.split('-').map(Number);
                 const [r2,c2] = k2.split('-').map(Number);
-                // 良いペアの条件: 同じ行、かつ横に隣接していればOK
-                const isPaired = (r1 === r2) && (Math.abs(c1 - c2) === 1);
+                // 良いペアの条件: 机ペアの隣同士（通路をはさむ列は不可）
+                const isPaired = isDeskNeighbor(r1, c1, r2, c2);
                 if(!isPaired) {
                     // 双方向に登録: どちらの子を動かしても直せるようにし、違反の重みも上げる
                     v.push({type:'good', p1:p1, p2:p2});
